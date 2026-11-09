@@ -1,0 +1,15 @@
+# Dependencias
+node_modules/
+
+# Secretos (el token del bot no se comparte)
+.env
+
+# Archivos que genera el taller
+datos/descargas/*
+datos/generado/*
+!datos/descargas/.gitkeep
+!datos/generado/.gitkeep
+
+# Basura del sistema
+Thumbs.db
+.DS_Store
