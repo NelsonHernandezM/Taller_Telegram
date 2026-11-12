@@ -1,4 +1,3 @@
-```bat
 @echo off
 REM =====================================================================
 REM  Arranca el bot del taller.
@@ -14,10 +13,7 @@ if not exist "node_modules" (
     if errorlevel 1 goto :error
 )
 
-if not exist "bin\calculadora.exe" (
-    echo Compilando el ejecutable de ejemplo...
-    call compilar-exe.bat nopausa
-)
+ 
 
 if not exist ".env" (
     echo.

@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const FormData = require('form-data');
 
@@ -32,6 +32,13 @@ if (!TOKEN) {
   console.error('[AVISO] Falta BOT_TOKEN: copia .env.example a .env y pega el token.');
 }
 
+// Los errores de red de Telegraf incluyen la URL completa, token incluido.
+// Todo lo que se imprime en consola pasa por aqui.
+function sinToken(texto) {
+  const s = String(texto);
+  return TOKEN ? s.split(TOKEN).join('<token>') : s;
+}
+
 bot.use((ctx, next) => {
   // No registrar ctx completo ni el texto: pueden incluir datos privados y el token.
   const mensaje = ctx.message;
@@ -43,6 +50,21 @@ bot.use((ctx, next) => {
   return next();
 });
 
+// /id va ANTES del filtro de acceso: asi cualquiera puede averiguar su id.
+bot.command('id', (ctx) => ctx.reply('Tu id de Telegram es: ' + ctx.from.id));
+
+// Quien puede usar el bot. Con USUARIOS_PERMITIDOS vacio el bot es abierto
+// (comodo en el taller); en cuanto lo llenas, solo esos ids pasan.
+// Este filtro tambien protege los botones: un callback query es un update mas.
+const PERMITIDOS = (process.env.USUARIOS_PERMITIDOS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+
+bot.use((ctx, next) => {
+  if (PERMITIDOS.length === 0) return next();
+  if (PERMITIDOS.includes(String(ctx.from?.id))) return next();
+  console.log('[bloqueado] usuario no permitido');
+});
+
 
 // --- 2. Utilidades del bot --------------------------------------------------
 
@@ -51,6 +73,8 @@ const AYUDA =
   '/sumar 2 3            suma usando Python\n' +
   '/multiplicar 4 2.5    multiplica usando Python\n' +
   '/exe sumar 7 5        invoca calculadora.exe directamente\n' +
+  '/calcular 7 5         te muestra botones para elegir\n' +
+  '/id                   muestra tu id de Telegram\n' +
   '/pdf                  envia el PDF de ejemplo\n' +
   '/imagen               envia la imagen de ejemplo\n\n' +
   'Tambien puedes enviarme un documento o una foto.';
@@ -60,7 +84,7 @@ async function responder(ctx, texto) {
   try {
     await ctx.reply(texto, { disable_web_page_preview: true });
   } catch (e) {
-    console.error('No se pudo responder:', e.message);
+    console.error('No se pudo responder:', sinToken(e.message));
   }
 }
 
@@ -74,9 +98,10 @@ function leerDosNumeros(texto) {
 
 /** Formatea un error de proceso para el usuario. */
 function textoError(e) {
-  if (e.code === 'ENOENT') {
+  if (e.code === 'ENOENT' || e.code === 'EACCES') {
     return 'No se encontró el programa. Revisa que "python" esté en el PATH ' +
-           'y que bin/calculadora.exe exista (ejecuta compilar-exe.bat).';
+           'y que bin/calculadora.exe exista (solo funciona en Windows; ' +
+           'si falta, ejecuta compilar-exe.bat).';
   }
   if (e.killed || e.signal) {
     return 'El proceso tardó demasiado y se canceló.';
@@ -113,7 +138,7 @@ async function enviarDocumentoResistente(ctx, buffer, nombreArchivo, caption = '
 
       return true; 
     } catch (err) {
-      const detalle = err.response ? JSON.stringify(err.response.data) : err.message;
+      const detalle = sinToken(err.response ? JSON.stringify(err.response.data) : err.message);
       console.error(`[AVISO] Error al enviar el archivo (intento ${intento}/3): ${detalle}`);
       if (intento < 3) await new Promise((r) => setTimeout(r, 2000));
     }
@@ -151,7 +176,7 @@ async function enviarFotoResistente(ctx, buffer, nombreArchivo, caption = '') {
 
       return true; 
     } catch (err) {
-      const detalle = err.response ? JSON.stringify(err.response.data) : err.message;
+      const detalle = sinToken(err.response ? JSON.stringify(err.response.data) : err.message);
       console.error(`[AVISO] Error al enviar la imagen (intento ${intento}/3): ${detalle}`);
       if (intento < 3) await new Promise((r) => setTimeout(r, 2000));
     }
@@ -205,6 +230,68 @@ bot.command('exe', async (ctx) => {
 });
 
 
+// --- Teclados en linea y callback queries ----------------------------------
+//
+//  Un teclado en linea son botones pegados al mensaje. Cada boton lleva un
+//  callback_data (maximo 64 bytes). Al pulsarlo Telegram NO manda texto:
+//  manda un "callback query" con ese callback_data, y Telegraf lo entrega
+//  a bot.action(...).
+//
+//      /calcular 7 5  ->  [botones]  ->  clic  ->  bot.action  ->  .exe/Python
+//
+//  Aqui el callback_data lleva todo lo necesario ("calc:sumar:exe:7:5"),
+//  asi que el bot no guarda nada en memoria entre el comando y el clic.
+
+const MOTORES = { py: '🐍 Python', exe: '⚙️ .exe' };
+
+bot.command('calcular', async (ctx) => {
+  const nums = leerDosNumeros(ctx.payload);
+  if (!nums) {
+    return responder(ctx, 'Uso: /calcular <numero> <numero>\nEjemplo: /calcular 7 5');
+  }
+  const [a, b] = nums;
+
+  // El dato mas largo posible debe caber en 64 bytes.
+  if (Buffer.byteLength(`calc:multiplicar:exe:${a}:${b}`) > 64) {
+    return responder(ctx, 'Esos numeros son demasiado largos para un boton.');
+  }
+
+  const boton = (texto, operacion, motor) =>
+    Markup.button.callback(texto, `calc:${operacion}:${motor}:${a}:${b}`);
+
+  const teclado = Markup.inlineKeyboard([
+    [boton('➕ Sumar con Python', 'sumar', 'py'),
+     boton('➕ Sumar con .exe', 'sumar', 'exe')],
+    [boton('✖️ Multiplicar con Python', 'multiplicar', 'py'),
+     boton('✖️ Multiplicar con .exe', 'multiplicar', 'exe')],
+  ]);
+
+  await ctx.reply(`¿Qué hago con ${a} y ${b}?`, teclado);
+});
+
+// Atrapa cualquier boton cuyo callback_data tenga la forma calc:op:motor:a:b
+bot.action(/^calc:(sumar|multiplicar):(py|exe):([^:]+):([^:]+)$/, async (ctx) => {
+  // ctx.match es el resultado de la expresion regular.
+  const [, operacion, motor, a, b] = ctx.match;
+
+  // 1) Siempre contestar el clic: apaga el relojito del boton.
+  await ctx.answerCbQuery('Calculando...');
+
+  // 2) Cambiar el mensaje. Al editar sin reply_markup, los botones
+  //    desaparecen: asi no se pulsan dos veces.
+  await ctx.editMessageText('⏳ Ejecutando con ' + MOTORES[motor] + '...');
+
+  // 3) Ejecutar. El callback_data NO es de fiar: ejecutarExe y
+  //    ejecutarPython vuelven a validar operacion y numeros.
+  try {
+    const ejecutar = motor === 'exe' ? proc.ejecutarExe : proc.ejecutarPython;
+    const { stdout } = await ejecutar(operacion, a, b);
+    await ctx.editMessageText(MOTORES[motor] + '\n' + stdout);
+  } catch (e) {
+    await ctx.editMessageText(textoError(e));
+  }
+});
+
 // --- Enviar archivos locales ---
 
 bot.command('pdf', async (ctx) => {
@@ -249,7 +336,7 @@ bot.command('imagen', async (ctx) => {
   }
 });
 
-// --- 4. Documentos e imagenes ----------------------------------------------
+// --- 5. Documentos e imagenes ----------------------------------------------
 
 bot.on('document', async (ctx) => {
   const doc = ctx.message.document;
@@ -287,13 +374,13 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// --- 5. Fallback y arranque -------------------------------------------------
+// --- 6. Fallback y arranque -------------------------------------------------
 
 // Se registra al final: cualquier texto que no sea comando cae aqui.
 bot.on('text', (ctx) => responder(ctx, 'No reconozco ese mensaje.\n\n' + AYUDA));
 
 bot.catch((err, ctx) => {
-  console.error('Error en', ctx.updateType, ':', err.message);
+  console.error('Error en', ctx.updateType, ':', sinToken(err.message));
 });
 
 // Permite importar el bot desde pruebas sin arrancar el polling.
@@ -309,6 +396,9 @@ if (require.main === module) {
   bot.launch().then(() => {
     console.log('Bot del taller listo. Abre Telegram y envia /start.');
     console.log('Python:', proc.PYTHON, '| Exe:', proc.EXE);
+  }).catch((e) => {
+    console.error('No se pudo iniciar el bot:', sinToken(e.message));
+    process.exit(1);
   });
 
   // Apagado limpio con Ctrl+C.
